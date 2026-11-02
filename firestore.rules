@@ -1,0 +1,109 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() { return request.auth != null; }
+    function circlePath(id) { return /databases/$(database)/documents/circles/$(id); }
+    function member(id) { return signedIn() && request.auth.uid in get(circlePath(id)).data.members; }
+    function active(id) { return get(circlePath(id)).data.get('deleting', false) == false; }
+    function cleanup(id) { return signedIn() && get(circlePath(id)).data.owner == request.auth.uid && !active(id); }
+    function memberAfter(id) { return getAfter(circlePath(id)).data.get('deleting', false) == false && signedIn() && request.auth.uid in getAfter(circlePath(id)).data.members; }
+    function ownerAfter(id) { return getAfter(circlePath(id)).data.get('deleting', false) == false && signedIn() && getAfter(circlePath(id)).data.owner == request.auth.uid; }
+    function protectedAmal(id) { return id in ['fajr', 'zuhr', 'asr', 'maghrib', 'isha', 'tilawat']; }
+    match /users/{uid} {
+      allow read, write: if signedIn() && request.auth.uid == uid;
+    }
+    match /invites/{code} {
+      allow get: if signedIn();
+      allow list: if false;
+      allow create: if signedIn() && request.resource.data.keys().hasOnly(['circleId', 'owner'])
+        && request.resource.data.owner == request.auth.uid
+        && ownerAfter(request.resource.data.circleId)
+        && getAfter(circlePath(request.resource.data.circleId)).data.inviteCode == code;
+      allow update: if false;
+      allow delete: if cleanup(resource.data.circleId);
+    }
+    match /circles/{circleId} {
+      // Membership queries use array-contains so only joined families can be listed.
+      allow read: if signedIn() && request.auth.uid in resource.data.members;
+      allow create: if signedIn() && request.resource.data.keys().hasOnly(['id', 'name', 'owner', 'inviteCode', 'members', 'deleting'])
+        && request.resource.data.get('deleting', false) == false
+        && request.resource.data.id == circleId && request.resource.data.owner == request.auth.uid
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80
+        && request.resource.data.inviteCode is string && request.resource.data.inviteCode.size() == 16
+        && request.resource.data.members == [request.auth.uid];
+      // A join can add only the current user, preserving all existing members and metadata.
+      allow update: if active(circleId) && signedIn() && request.auth.uid == resource.data.owner
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['name'])
+        && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80;
+      allow update: if active(circleId) && signedIn()
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['members', 'joinProof'])
+        && request.resource.data.joinProof == resource.data.inviteCode
+        && request.resource.data.members is list
+        && request.resource.data.members.size() <= 30
+        && request.resource.data.members.toSet() == resource.data.members.toSet().union([request.auth.uid].toSet())
+        && exists(/databases/$(database)/documents/invites/$(resource.data.inviteCode))
+        && get(/databases/$(database)/documents/invites/$(resource.data.inviteCode)).data.circleId == circleId;
+      // Lock writes first; the owner can resume paginated cleanup after interruption.
+      allow update: if signedIn() && request.auth.uid == resource.data.owner
+        && request.resource.data.diff(resource.data).affectedKeys().hasOnly(['deleting'])
+        && request.resource.data.deleting == true;
+      allow delete: if cleanup(circleId)
+        && !existsAfter(/databases/$(database)/documents/invites/$(resource.data.inviteCode));
+      match /{collection}/{document} {
+        allow delete: if collection in ['profiles', 'amals', 'retiredAmals', 'logs'] && cleanup(circleId);
+      }
+      match /profiles/{uid} {
+        allow read: if member(circleId);
+        allow create, update: if memberAfter(circleId) && uid == request.auth.uid
+          && request.resource.data.keys().hasOnly(['name']) && request.resource.data.name is string;
+        allow delete: if false;
+      }
+      match /amals/{amalId} {
+        allow read: if member(circleId);
+        allow create, update: if memberAfter(circleId)
+          && request.resource.data.keys().hasOnly(['id', 'name', 'category', 'frequency', 'weekday', 'hijriMonth', 'hijriDay', 'active'])
+          && request.resource.data.id == amalId
+          && !exists(/databases/$(database)/documents/circles/$(circleId)/retiredAmals/$(amalId))
+          && (!(amalId in ['fajr', 'zuhr', 'asr', 'maghrib', 'isha'])
+            || (request.resource.data.category == 'Prayer' && request.resource.data.frequency == 'daily'))
+          && (amalId != 'tilawat' || (request.resource.data.category == 'Tilawat' && request.resource.data.frequency == 'daily'))
+          && request.resource.data.name is string && request.resource.data.name.size() > 0 && request.resource.data.name.size() <= 80
+          && request.resource.data.category in ['Prayer', 'Common', 'Azkar', 'Tilawat']
+          && request.resource.data.frequency in ['daily', 'weekly', 'islamic']
+          && request.resource.data.weekday is int && request.resource.data.weekday >= 1 && request.resource.data.weekday <= 7
+          && request.resource.data.hijriMonth is int && request.resource.data.hijriMonth >= 1 && request.resource.data.hijriMonth <= 12
+          && request.resource.data.hijriDay is int && request.resource.data.hijriDay >= 1 && request.resource.data.hijriDay <= 30
+          && request.resource.data.active is bool;
+        allow delete: if ownerAfter(circleId) && !protectedAmal(amalId)
+          && getAfter(/databases/$(database)/documents/circles/$(circleId)/retiredAmals/$(amalId)).data == resource.data;
+      }
+      // Immutable definitions preserve classification of existing logs after an amal is deleted.
+      match /retiredAmals/{amalId} {
+        allow read: if member(circleId);
+        allow create: if ownerAfter(circleId) && !protectedAmal(amalId)
+          && request.resource.data == get(/databases/$(database)/documents/circles/$(circleId)/amals/$(amalId)).data
+          && !existsAfter(/databases/$(database)/documents/circles/$(circleId)/amals/$(amalId));
+        allow update, delete: if false;
+      }
+      match /logs/{logId} {
+        function validLog() {
+          let d = request.resource.data;
+          let amal = get(/databases/$(database)/documents/circles/$(circleId)/amals/$(d.amalId)).data;
+          return d.keys().hasOnly(['id', 'uid', 'amalId', 'date', 'status', 'score'])
+            && d.uid == request.auth.uid && d.id == logId
+            && d.date is string && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+            && logId == d.uid + '_' + d.date + '_' + d.amalId
+            && ((amal.category != 'Prayer' && d.status == 'Completed' && d.score == 10)
+              || (amal.category == 'Prayer' && (
+                (d.status == 'Takbir-e-Ula' && d.score == 10) || (d.status == 'Prayed in Jamat' && d.score == 8)
+                || (d.status == 'Masbuk' && d.score == 6) || (d.status == 'Prayed in Time' && d.score == 5)
+                || (d.status == 'Qada' && d.score == 2))));
+        }
+        allow read: if member(circleId);
+        allow create: if member(circleId) && active(circleId) && validLog();
+        allow update: if member(circleId) && active(circleId) && resource.data.uid == request.auth.uid && validLog();
+        allow delete: if member(circleId) && active(circleId) && resource.data.uid == request.auth.uid;
+      }
+    }
+  }
+}

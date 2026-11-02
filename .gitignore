@@ -1,0 +1,12 @@
+.gradle/
+.kotlin/
+**/build/
+local.properties
+app/google-services.json
+*.jks
+*.keystore
+node_modules/
+*-debug.log
+.firebase/
+__pycache__/
+.claude/settings.local.json
